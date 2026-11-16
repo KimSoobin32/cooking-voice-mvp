@@ -9,7 +9,6 @@ import CookingCompleteModal from "@/components/CookingCompleteModal";
 import { playBeep } from "@/utils/sound";
 import {
   Volume2,
-  VolumeX,
   Mic,
   MicOff,
   ChevronLeft,
@@ -21,11 +20,12 @@ import {
   Pause,
   Bell,
   Sparkles,
-  Smartphone,
   Shield,
   Lightbulb,
   CheckCircle,
-  AlertCircle
+  Camera,
+  CameraOff,
+  Hand,
 } from "lucide-react";
 
 export default function CookingModePage() {
@@ -58,6 +58,11 @@ export default function CookingModePage() {
   const [gestureTriggered, setGestureTriggered] = useState(false);
   const [wakeLockActive, setWakeLockActive] = useState(false);
 
+  // Air-Wave camera state
+  const [cameraAllowed, setCameraAllowed] = useState<boolean | null>(null); // null = pending
+  const [airWaveReady, setAirWaveReady] = useState(false);
+  const [shadowDetected, setShadowDetected] = useState(false);
+
   // Modals
   const [isOverviewOpen, setIsOverviewOpen] = useState(false);
   const [isCompleted, setIsCompleted] = useState(false);
@@ -75,6 +80,16 @@ export default function CookingModePage() {
   const wakeLockRef = useRef<any>(null);
   const recognitionRef = useRef<any>(null);
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Air-Wave refs
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const offscreenCanvasRef = useRef<HTMLCanvasElement>(null);
+  const previewVideoRef = useRef<HTMLVideoElement>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
+  const airWaveIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const brightnessHistoryRef = useRef<number[]>([]);
+  const shadowStartRef = useRef<number>(0);  // timestamp when shadow began (0 = no shadow)
+  const airWaveCooldownRef = useRef<boolean>(false);
 
   // -------------------------------------------------------------
   // 1. Screen Wake Lock API
@@ -146,7 +161,7 @@ export default function CookingModePage() {
   // -------------------------------------------------------------
   const goToNextStep = useCallback(() => {
     const now = Date.now();
-    // Edge case 2: 1.5s debounce guard to prevent double triggering
+    // 1.5s debounce guard to prevent double triggering
     if (now - lastStepTransitionTimeRef.current < 1500) {
       return;
     }
@@ -276,7 +291,7 @@ export default function CookingModePage() {
     };
 
     recognition.onresult = (event: any) => {
-      // [중요 예외 처리 1 - Echo 방지]: TTS 재생 중에는 STT 입력 무시
+      // [중요 예외 처리 - Echo 방지]: TTS 재생 중에는 STT 입력 무시
       if (isSpeakingRef.current) {
         console.log("Echo filter: Speech synthesis is speaking. Ignoring microphone transcript.");
         return;
@@ -339,57 +354,174 @@ export default function CookingModePage() {
   }, [goToNextStep, goToPrevStep, toggleTimer, speakText, currentStep]);
 
   // -------------------------------------------------------------
-  // 6. Touchless Gesture Sensor (DeviceMotionEvent)
+  // 6. Air-Wave: 전면 카메라 초경량 그림자 감지
   // -------------------------------------------------------------
-  const triggerGestureAdvance = useCallback(() => {
-    setGestureTriggered(true);
-    goToNextStep();
-    setTimeout(() => setGestureTriggered(false), 1200);
-  }, [goToNextStep]);
 
+  // 카메라 스트림 초기화 (컴포넌트 마운트 시 1회)
   useEffect(() => {
-    let lastX = 0;
-    let lastY = 0;
-    let lastZ = 0;
-    const SHAKE_THRESHOLD = 22; // Acceleration threshold for tap/shake
+    let mounted = true;
 
-    const handleDeviceMotion = (event: DeviceMotionEvent) => {
-      const acc = event.accelerationIncludingGravity || event.acceleration;
-      if (!acc || acc.x === null || acc.y === null || acc.z === null) return;
+    async function startCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user", width: { ideal: 320 }, height: { ideal: 240 } },
+          audio: false,
+        });
+        if (!mounted) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        cameraStreamRef.current = stream;
 
-      const deltaX = Math.abs(acc.x - lastX);
-      const deltaY = Math.abs(acc.y - lastY);
-      const deltaZ = Math.abs(acc.z - lastZ);
+        // 오프스크린 처리용 hidden video
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.play().catch(() => {});
+        }
+        // 상단 미리보기용 small video
+        if (previewVideoRef.current) {
+          previewVideoRef.current.srcObject = stream;
+          previewVideoRef.current.play().catch(() => {});
+        }
 
-      lastX = acc.x;
-      lastY = acc.y;
-      lastZ = acc.z;
+        setCameraAllowed(true);
+        setAirWaveReady(true);
+      } catch (err) {
+        console.warn("Camera permission denied or unavailable:", err);
+        if (mounted) {
+          setCameraAllowed(false);
+          setAirWaveReady(false);
+        }
+      }
+    }
 
-      if (deltaX + deltaY + deltaZ > SHAKE_THRESHOLD) {
-        triggerGestureAdvance();
+    startCamera();
+
+    return () => {
+      mounted = false;
+      if (cameraStreamRef.current) {
+        cameraStreamRef.current.getTracks().forEach((t) => t.stop());
+        cameraStreamRef.current = null;
+      }
+      if (airWaveIntervalRef.current) {
+        clearInterval(airWaveIntervalRef.current);
       }
     };
+  }, []);
 
-    window.addEventListener("devicemotion", handleDeviceMotion);
+  // 100ms 간격 밝기 분석 루프 (카메라 허용 후 시작)
+  useEffect(() => {
+    if (!airWaveReady) return;
+
+    airWaveIntervalRef.current = setInterval(() => {
+      const video = videoRef.current;
+      const canvas = offscreenCanvasRef.current;
+      if (!video || !canvas || video.readyState < 2) return;
+
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return;
+
+      // 32x32 오프스크린 렌더
+      ctx.drawImage(video, 0, 0, 32, 32);
+      const imgData = ctx.getImageData(0, 0, 32, 32);
+      const d = imgData.data;
+
+      // 평균 밝기 계산 (RGB 평균)
+      let sum = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        sum += (d[i] + d[i + 1] + d[i + 2]) / 3;
+      }
+      const currentBrightness = sum / (32 * 32); // 0~255
+
+      // 최근 1초(10샘플) 이동 평균 → Baseline
+      const history = brightnessHistoryRef.current;
+      history.push(currentBrightness);
+      if (history.length > 10) history.shift();
+
+      // baseline은 최신 샘플을 제외한 이전 평균 (현재 프레임 오염 방지)
+      const baselineSamples = history.slice(0, history.length - 1);
+      if (baselineSamples.length < 3) return; // 충분한 baseline 없으면 skip
+      const baseline =
+        baselineSamples.reduce((a, b) => a + b, 0) / baselineSamples.length;
+
+      // 쿨타임 중이면 무시
+      if (airWaveCooldownRef.current) return;
+
+      const dropRatio = baseline > 10 ? (baseline - currentBrightness) / baseline : 0;
+
+      if (shadowStartRef.current === 0) {
+        // 아직 shadow 없는 상태 → 45% 이상 급락 시 shadow 시작
+        if (dropRatio >= 0.45) {
+          shadowStartRef.current = Date.now();
+          setShadowDetected(true);
+        }
+      } else {
+        // shadow 진행 중
+        const elapsed = Date.now() - shadowStartRef.current;
+
+        if (elapsed > 1500) {
+          // 1.5초 이상 지속 → 조명 꺼짐 등으로 간주, 리셋
+          shadowStartRef.current = 0;
+          setShadowDetected(false);
+          return;
+        }
+
+        // 1.2초 이내에 밝기가 baseline의 90% 이상으로 회복 → 제스처 성공!
+        if (elapsed <= 1200 && currentBrightness >= baseline * 0.9) {
+          shadowStartRef.current = 0;
+          setShadowDetected(false);
+
+          // Air-Wave 트리거
+          setGestureTriggered(true);
+          goToNextStep();
+          setTimeout(() => setGestureTriggered(false), 1500);
+
+          // 1.5s 쿨타임
+          airWaveCooldownRef.current = true;
+          setTimeout(() => {
+            airWaveCooldownRef.current = false;
+          }, 1500);
+        }
+      }
+    }, 100);
+
     return () => {
-      window.removeEventListener("devicemotion", handleDeviceMotion);
+      if (airWaveIntervalRef.current) {
+        clearInterval(airWaveIntervalRef.current);
+      }
     };
-  }, [triggerGestureAdvance]);
+  }, [airWaveReady, goToNextStep]);
 
-  // Format MM:SS for timer
+  // Air-Wave 시뮬레이션 버튼
+  const triggerAirWaveSimulation = useCallback(() => {
+    if (airWaveCooldownRef.current) return;
+    setGestureTriggered(true);
+    goToNextStep();
+    airWaveCooldownRef.current = true;
+    setTimeout(() => {
+      setGestureTriggered(false);
+      airWaveCooldownRef.current = false;
+    }, 1500);
+  }, [goToNextStep]);
+
+  // -------------------------------------------------------------
+  // 7. Helpers
+  // -------------------------------------------------------------
   const formatTimer = (sec: number) => {
     const m = Math.floor(sec / 60);
     const s = sec % 60;
     return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   };
 
-  // Split and highlight text based on highlight words
   const renderHighlightedText = (text: string, highlightWords?: string[]) => {
     if (!highlightWords || highlightWords.length === 0) {
       return text;
     }
 
-    const regex = new RegExp(`(${highlightWords.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "gi");
+    const regex = new RegExp(
+      `(${highlightWords.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`,
+      "gi"
+    );
     const parts = text.split(regex);
 
     return parts.map((part, i) => {
@@ -412,28 +544,78 @@ export default function CookingModePage() {
 
   return (
     <div className="flex flex-col h-screen max-h-screen bg-stone-50 overflow-hidden relative select-none">
-      {/* 1. Top Bar: Progress, Overview Button, Exit */}
+      {/* Hidden elements for Air-Wave processing */}
+      <video
+        ref={videoRef}
+        muted
+        playsInline
+        style={{ display: "none" }}
+        aria-hidden="true"
+      />
+      <canvas
+        ref={offscreenCanvasRef}
+        width={32}
+        height={32}
+        style={{ display: "none" }}
+        aria-hidden="true"
+      />
+
+      {/* 1. Top Bar: Progress, Air-Wave Test Button, Overview Button, Exit */}
       <header className="px-4 py-3 bg-white border-b border-stone-200 shrink-0 z-20">
         <div className="flex items-center justify-between gap-2">
-          {/* Progress Info */}
+          {/* Progress Info + Camera Preview */}
           <div className="flex items-center gap-2">
             <span className="text-xs font-black text-white bg-stone-900 px-2.5 py-1 rounded-full">
               {currentStepIndex + 1} / {totalSteps}
             </span>
-            <span className="text-xs font-bold text-stone-700 truncate max-w-[120px]">
+            <span className="text-xs font-bold text-stone-700 truncate max-w-[100px]">
               {recipe.title}
             </span>
+
+            {/* 카메라 원형 미리보기 or 상태 표시 */}
+            <div className="relative shrink-0">
+              {cameraAllowed === true ? (
+                <div
+                  className={`w-8 h-8 rounded-full overflow-hidden border-2 ${
+                    shadowDetected
+                      ? "border-amber-400 shadow-md shadow-amber-300/50"
+                      : airWaveReady
+                      ? "border-emerald-400"
+                      : "border-stone-300"
+                  }`}
+                >
+                  <video
+                    ref={previewVideoRef}
+                    muted
+                    playsInline
+                    className="w-full h-full object-cover scale-x-[-1]"
+                  />
+                </div>
+              ) : cameraAllowed === false ? (
+                <div className="w-8 h-8 rounded-full bg-stone-100 border-2 border-stone-300 flex items-center justify-center">
+                  <CameraOff className="w-3.5 h-3.5 text-stone-400" />
+                </div>
+              ) : (
+                <div className="w-8 h-8 rounded-full bg-stone-100 border-2 border-stone-200 flex items-center justify-center animate-pulse">
+                  <Camera className="w-3.5 h-3.5 text-stone-400" />
+                </div>
+              )}
+              {/* Shadow detection indicator dot */}
+              {shadowDetected && (
+                <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping" />
+              )}
+            </div>
           </div>
 
           <div className="flex items-center gap-1.5">
-            {/* Gesture Simulator Button for Desktop testing */}
+            {/* Air-Wave Simulation Button */}
             <button
-              onClick={triggerGestureAdvance}
-              title="가속도 센서 탭/흔들기 테스트"
+              onClick={triggerAirWaveSimulation}
+              title="Air-Wave 제스처 시뮬레이션"
               className="text-[11px] font-bold px-2 py-1 rounded-lg bg-orange-100 hover:bg-orange-200 text-orange-800 border border-orange-200 flex items-center gap-1 active:scale-95 transition-transform"
             >
-              <Smartphone className="w-3 h-3 text-orange-600" />
-              <span>👋 제스처 시뮬레이션</span>
+              <Hand className="w-3 h-3 text-orange-600" />
+              <span>👋 Air-Wave 테스트</span>
             </button>
 
             {/* Overview List Button */}
@@ -469,7 +651,7 @@ export default function CookingModePage() {
         </div>
       </header>
 
-      {/* 2. Status Badge (Voice Listening, Echo Filter, Gesture Cooldown) */}
+      {/* 2. Status Badge */}
       <div className="px-4 py-2 bg-gradient-to-r from-stone-900 via-stone-800 to-stone-900 text-white shrink-0 shadow-xs">
         <div className="flex items-center justify-between text-[11px] font-semibold">
           {/* Voice State */}
@@ -493,8 +675,19 @@ export default function CookingModePage() {
             )}
           </div>
 
-          {/* Screen WakeLock / Cooldown Badge */}
-          <div className="flex items-center gap-1 text-[10px] text-stone-300 shrink-0">
+          {/* Air-Wave & WakeLock status */}
+          <div className="flex items-center gap-2 text-[10px] text-stone-300 shrink-0">
+            {cameraAllowed === true ? (
+              <span className="flex items-center gap-0.5 text-emerald-400">
+                <Camera className="w-3 h-3" />
+                <span>Air-Wave ON</span>
+              </span>
+            ) : cameraAllowed === false ? (
+              <span className="flex items-center gap-0.5 text-stone-500">
+                <CameraOff className="w-3 h-3" />
+                <span>카메라 없음</span>
+              </span>
+            ) : null}
             <Shield className="w-3 h-3 text-orange-400" />
             <span>화면 켜짐 유지</span>
           </div>
@@ -508,17 +701,29 @@ export default function CookingModePage() {
           </div>
         )}
 
-        {/* Gesture feedback toast */}
+        {/* Air-Wave gesture feedback toast */}
         {gestureTriggered && (
           <div className="mt-1.5 py-1 px-2.5 bg-amber-500 text-white rounded-lg text-xs font-bold flex items-center justify-between animate-in slide-in-from-top-1">
-            <span>👋 톡톡 모션 감지! 다음 단계로 이동</span>
+            <span>👋 Air-Wave 감지! 다음 단계로 이동</span>
             <Sparkles className="w-3.5 h-3.5" />
+          </div>
+        )}
+
+        {/* Shadow detecting toast */}
+        {shadowDetected && !gestureTriggered && (
+          <div className="mt-1.5 py-1 px-2.5 bg-stone-700 text-amber-300 rounded-lg text-xs font-bold flex items-center gap-1.5 animate-in slide-in-from-top-1">
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
+            <span>✋ 손 감지 중… 치우면 다음 단계로 이동</span>
           </div>
         )}
       </div>
 
-      {/* 3. Main Center Content: Giant Step Instruction & Conditional Timer */}
-      <div className="flex-1 p-5 overflow-y-auto flex flex-col justify-between no-scrollbar space-y-4">
+      {/* 3. Main Center Content: clickable area → next step */}
+      <div
+        className="flex-1 p-5 overflow-y-auto flex flex-col justify-between no-scrollbar space-y-4 cursor-pointer active:bg-orange-50/40 transition-colors"
+        onClick={goToNextStep}
+        title="탭하여 다음 단계로"
+      >
         <div className="space-y-4 my-auto">
           {/* Step Number Tag */}
           <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-orange-100 border border-orange-200 text-orange-700 text-xs font-black">
@@ -527,10 +732,18 @@ export default function CookingModePage() {
             <span>{currentStep.timerSeconds ? `${currentStep.timerSeconds}초 소요` : "행동 지침"}</span>
           </div>
 
-          {/* Giant Step Instruction Text (24px~28px Bold) */}
+          {/* Giant Step Instruction Text */}
           <div className="text-[25px] sm:text-[28px] font-extrabold text-stone-900 leading-[1.38] tracking-tight">
             {renderHighlightedText(currentStep.text, currentStep.highlightWords)}
           </div>
+
+          {/* Air-Wave hint */}
+          {cameraAllowed === true && (
+            <div className="flex items-center gap-1.5 text-[11px] text-stone-400 font-medium">
+              <Hand className="w-3.5 h-3.5 text-orange-400" />
+              <span>카메라 앞에서 손을 흔들면 다음 단계로 이동해요</span>
+            </div>
+          )}
 
           {/* Cooking Tip Box */}
           {currentStep.tip && (
@@ -545,13 +758,16 @@ export default function CookingModePage() {
 
           {/* Conditional Timer Widget */}
           {currentStep.timerSeconds && currentStep.timerSeconds > 0 ? (
-            <div className={`p-4 rounded-3xl border transition-all ${
-              isTimerFinished
-                ? "bg-rose-50 border-rose-300 animate-pulse"
-                : isTimerRunning
-                ? "bg-orange-50/90 border-orange-300 shadow-md"
-                : "bg-white border-stone-200 shadow-xs"
-            }`}>
+            <div
+              className={`p-4 rounded-3xl border transition-all ${
+                isTimerFinished
+                  ? "bg-rose-50 border-rose-300 animate-pulse"
+                  : isTimerRunning
+                  ? "bg-orange-50/90 border-orange-300 shadow-md"
+                  : "bg-white border-stone-200 shadow-xs"
+              }`}
+              onClick={(e) => e.stopPropagation()} // 타이머 클릭 시 단계 전환 방지
+            >
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-bold text-stone-600 flex items-center gap-1">
                   <Bell className={`w-3.5 h-3.5 ${isTimerRunning ? "text-orange-500 animate-bounce" : "text-stone-400"}`} />
@@ -607,7 +823,7 @@ export default function CookingModePage() {
         </div>
       </div>
 
-      {/* 4. Bottom Control Bar (Height >= 64px for easy wrist/elbow tapping) */}
+      {/* 4. Bottom Control Bar */}
       <div className="px-3 py-3.5 bg-white border-t border-stone-200 shadow-xl shrink-0 z-20">
         <div className="grid grid-cols-3 gap-2.5 h-[68px]">
           {/* [< 이전] Button */}
